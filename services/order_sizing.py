@@ -2,6 +2,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
+from config.risk_limits import RISK_LIMITS
 from strategy.decision import Action, TradingDecision
 from strategy.risk_manager import RiskManager
 
@@ -23,8 +24,8 @@ class OrderSizingService:
 
     def __init__(
         self,
-        max_order_value: float = 500.0,
-        quantity_precision: int = 6,
+        max_order_value: float = RISK_LIMITS.max_order_value,
+        quantity_precision: int = RISK_LIMITS.quantity_precision,
     ) -> None:
         if (
             isinstance(max_order_value, bool)
