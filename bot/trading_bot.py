@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import math
@@ -6,33 +5,20 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from agents.ollama_client import OllamaClient
 from agents.orchestrator import AgentOrchestrator
-from agents.portfolio import create_portfolio_agent
-from agents.risk import create_risk_agent
-from agents.technical import create_technical_agent
+from bot.runtime import BotRuntime, build_runtime
 from client import Trading212Client
+from config.risk_limits import RISK_LIMITS
+from config.settings import SETTINGS
 from execution.order_executor import OrderExecutor
 from services.market_data import MarketDataService
+from services.order_sizing import OrderSizingService
 from services.stop_loss_verifier import StopLossResult, StopLossVerifier
 from strategy.decision import Action, DecisionAgent, TradingDecision
 from strategy.risk_manager import RiskManager
 
 
 logger = logging.getLogger(__name__)
-
-MIN_CONFIDENCE = 0.65
-MAX_ORDER_VALUE = 500.0
-MAX_POSITION_VALUE = 1000.0
-QUANTITY_PRECISION = 6
-
-# Sicherheitskonfiguration:
-# Es werden standardmäßig keine Orders an Trading 212 gesendet.
-DRY_RUN = True
-
-# Zusätzliche Freigabe für Demo-Orders.
-# Bleibt deaktiviert, bis API-Antworten und Tests geprüft wurden.
-DEMO_ORDERS_ENABLED = False
 
 
 def _is_valid_number(value: Any) -> bool:
@@ -78,155 +64,12 @@ def print_decision(decision: TradingDecision) -> None:
     print("-" * 60)
 
 
-def prepare_order(
-    decision: TradingDecision,
-    market_data: Any,
-    risk_manager: RiskManager,
-) -> tuple[TradingDecision | None, str]:
-    """
-    Berechnet die Ordermenge und prüft deterministische Risikolimits.
-
-    Führt keine Orders aus.
-    """
-    if decision.action == Action.HOLD:
-        return None, "HOLD - keine Order erforderlich."
-
-    price = market_data.current_price
-    fx_rate = market_data.fx_rate_to_account
-    available_cash = market_data.account_cash
-
-    for name, value in (
-        ("aktueller Kurs", price),
-        ("Wechselkurs", fx_rate),
-        ("verfügbares Guthaben", available_cash),
-    ):
-        if not _is_valid_number(value):
-            return None, f"Ungültiger oder fehlender Wert: {name}."
-
-    if price <= 0:
-        return None, "Der aktuelle Kurs muss größer als null sein."
-
-    if fx_rate <= 0:
-        return None, "Der Wechselkurs muss größer als null sein."
-
-    if available_cash < 0:
-        return None, "Verfügbares Guthaben darf nicht negativ sein."
-
-    account_price = price * fx_rate
-
-    if not _is_valid_number(account_price) or account_price <= 0:
-        return None, "Berechneter Kurs in Kontowährung ist ungültig."
-
-    positions = getattr(market_data, "positions", None)
-
-    if not isinstance(positions, list):
-        return None, "Positionsdaten fehlen oder sind ungültig."
-
-    matching_positions = [
-        position
-        for position in positions
-        if getattr(position, "ticker", None) == decision.ticker
-    ]
-
-    if len(matching_positions) > 1:
-        return None, "Mehrere passende Positionen gefunden."
-
-    position = matching_positions[0] if matching_positions else None
-
-    raw_quantity = (
-        getattr(position, "quantity", None)
-        if position is not None
-        else 0.0
-    )
-
-    if not _is_valid_number(raw_quantity):
-        return None, "Ungültige Menge der bestehenden Position."
-
-    position_quantity = abs(raw_quantity)
-
-    raw_position_price = (
-        getattr(position, "current_price", None)
-        if position is not None
-        else price
-    )
-
-    if (
-        not _is_valid_number(raw_position_price)
-        or raw_position_price <= 0
-    ):
-        return None, "Ungültiger Kurs der bestehenden Position."
-
-    current_position_value = (
-        position_quantity * raw_position_price * fx_rate
-    )
-
-    if (
-        not _is_valid_number(current_position_value)
-        or current_position_value < 0
-    ):
-        return None, "Wert der bestehenden Position ist ungültig."
-
-    if decision.action == Action.BUY:
-        order_value = min(MAX_ORDER_VALUE, available_cash)
-
-        if order_value <= 0:
-            return None, "Kein verfügbares Guthaben für einen Kauf."
-
-        quantity = round(
-            order_value / account_price,
-            QUANTITY_PRECISION,
-        )
-
-    elif decision.action == Action.SELL:
-        if position_quantity <= 0:
-            return None, "Keine bestehende Position zum Verkaufen."
-
-        quantity = round(
-            position_quantity,
-            QUANTITY_PRECISION,
-        )
-
-    else:
-        return None, f"Unbekannte Aktion: {decision.action}"
-
-    if not _is_valid_number(quantity) or quantity <= 0:
-        return None, "Berechnete Ordermenge ist ungültig."
-
-    actual_order_value = quantity * account_price
-
-    if not _is_valid_number(actual_order_value):
-        return None, "Berechneter Orderwert ist ungültig."
-
-    if decision.action == Action.BUY:
-        if actual_order_value > available_cash:
-            return None, "Orderwert überschreitet das verfügbare Guthaben."
-
-        if actual_order_value > MAX_ORDER_VALUE:
-            return None, "Orderwert überschreitet das Orderlimit."
-
-    approved, validation_message = risk_manager.validate(
-        decision=decision,
-        current_price_account_currency=account_price,
-        current_position_value=current_position_value,
-        current_position_quantity=position_quantity,
-        available_cash=available_cash,
-        order_quantity=quantity,
-    )
-
-    if not approved:
-        return None, validation_message
-
-    sized_decision = replace(decision, quantity=quantity)
-
-    return sized_decision, validation_message
-
-
 class TradingBot:
     def __init__(
         self,
-        credentials_path: str = "credentials.json",
-        interval: int = 300,
-        ticker: str = "AAPL_US_EQ",
+        credentials_path: str = SETTINGS.credentials_path,
+        interval: int = SETTINGS.default_interval,
+        ticker: str = SETTINGS.default_ticker,
     ) -> None:
         if (
             isinstance(interval, bool)
@@ -243,6 +86,10 @@ class TradingBot:
         self.credentials_path = credentials_path
         self.interval = interval
         self.ticker = ticker.strip()
+        self.order_sizing_service = OrderSizingService(
+            max_order_value=RISK_LIMITS.max_order_value,
+            quantity_precision=RISK_LIMITS.quantity_precision,
+        )
 
     async def _run_once(
         self,
@@ -457,7 +304,7 @@ class TradingBot:
                 )
                 return
 
-        sized_decision, validation_message = prepare_order(
+        sized_decision, validation_message = self.order_sizing_service.prepare_order(
             decision=decision,
             market_data=market_data,
             risk_manager=risk_manager,
@@ -472,7 +319,7 @@ class TradingBot:
         print_decision(sized_decision)
 
         # Die aktuelle Version erlaubt ausschließlich Dry-Run.
-        if DRY_RUN is not True:
+        if SETTINGS.dry_run is not True:
             raise RuntimeError(
                 "Sicherheitsabbruch: Orderausführung ist in dieser "
                 "Version gesperrt."
@@ -488,79 +335,33 @@ class TradingBot:
         logger.info("Dry-Run abgeschlossen: %s", result)
 
     async def run(self) -> None:
-        ollama_clients: list[OllamaClient] = []
-        trading212 = None
+        runtime: BotRuntime | None = None
 
         try:
-            technical_ollama = OllamaClient(
-                base_url="http://localhost:11434",
-                model="qwen3:8b",
-                timeout=300.0,
-                max_concurrent=1,
-            )
-            ollama_clients.append(technical_ollama)
-
-            portfolio_ollama = OllamaClient(
-                base_url="http://localhost:11434",
-                model="qwen3:8b",
-                timeout=300.0,
-                max_concurrent=1,
-            )
-            ollama_clients.append(portfolio_ollama)
-
-            trading212 = Trading212Client(
+            runtime = await build_runtime(
                 credentials_path=self.credentials_path,
-                demo_orders_enabled=DEMO_ORDERS_ENABLED,
             )
-
-            market_data_service = MarketDataService(trading212)
-
-            risk_agent = create_risk_agent(technical_ollama)
-
-            agents = [
-                create_technical_agent(technical_ollama),
-                risk_agent,
-                create_portfolio_agent(portfolio_ollama),
-            ]
-
-            orchestrator = AgentOrchestrator(agents)
-
-            decision_agent = DecisionAgent(
-                min_confidence=MIN_CONFIDENCE,
-            )
-
-            risk_manager = RiskManager(
-                max_order_value=MAX_ORDER_VALUE,
-                max_position_value=MAX_POSITION_VALUE,
-            )
-
-            order_executor = OrderExecutor(
-                trading212=trading212,
-                dry_run=True,
-            )
-
-            stop_loss_verifier = StopLossVerifier()
 
             logger.info(
                 "TradingBot gestartet | Ticker=%s | Intervall=%ss | "
                 "DRY_RUN=%s | DEMO_ORDERS_ENABLED=%s",
                 self.ticker,
                 self.interval,
-                DRY_RUN,
-                DEMO_ORDERS_ENABLED,
+                SETTINGS.dry_run,
+                SETTINGS.demo_orders_enabled,
             )
 
             while True:
                 try:
                     await self._run_once(
-                        market_data_service=market_data_service,
-                        orchestrator=orchestrator,
-                        decision_agent=decision_agent,
-                        risk_manager=risk_manager,
-                        order_executor=order_executor,
-                        trading212=trading212,
-                        risk_agent=risk_agent,
-                        stop_loss_verifier=stop_loss_verifier,
+                        market_data_service=runtime.market_data_service,
+                        orchestrator=runtime.orchestrator,
+                        decision_agent=runtime.decision_agent,
+                        risk_manager=runtime.risk_manager,
+                        order_executor=runtime.order_executor,
+                        trading212=runtime.trading212,
+                        risk_agent=runtime.risk_agent,
+                        stop_loss_verifier=runtime.stop_loss_verifier,
                     )
 
                 except asyncio.CancelledError:
@@ -584,35 +385,8 @@ class TradingBot:
             raise
 
         finally:
-            try:
-                close_results = await asyncio.gather(
-                    *(client.close() for client in ollama_clients),
-                    return_exceptions=True,
-                )
-
-                for result in close_results:
-                    if isinstance(result, BaseException):
-                        logger.error(
-                            "Ollama-Client konnte nicht sauber "
-                            "geschlossen werden: %s: %s",
-                            type(result).__name__,
-                            result,
-                        )
-
-            finally:
-                if trading212 is not None:
-                    session = getattr(trading212, "session", None)
-
-                    if session is not None:
-                        try:
-                            await asyncio.to_thread(session.close)
-                        except Exception:
-                            logger.exception(
-                                "Trading212-Session konnte nicht "
-                                "sauber geschlossen werden."
-                            )
-
-                logger.info("TradingBot-Ressourcen geschlossen.")
+            if runtime is not None:
+                await runtime.close()
 
 
 if __name__ == "__main__":
