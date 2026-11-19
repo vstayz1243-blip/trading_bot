@@ -6,13 +6,10 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from agents.ollama_client import OllamaClient
 from agents.orchestrator import AgentOrchestrator
 from execution.order_executor import OrderExecutor
 from services.market_data import MarketDataService
-from agents.portfolio import create_portfolio_agent
-from agents.risk import create_risk_agent
-from agents.technical import create_technical_agent
+from bot.runtime import BotRuntime, build_runtime
 from client import Trading212Client
 from config.risk_limits import RISK_LIMITS
 from config.settings import SETTINGS
@@ -341,58 +338,12 @@ class TradingBot:
         logger.info("Dry-Run abgeschlossen: %s", result)
 
     async def run(self) -> None:
-        ollama_clients: list[OllamaClient] = []
-        trading212 = None
+        runtime: BotRuntime | None = None
 
         try:
-            technical_ollama = OllamaClient(
-                base_url=SETTINGS.ollama_base_url,
-                model=SETTINGS.ollama_model,
-                timeout=SETTINGS.ollama_timeout,
-                max_concurrent=SETTINGS.ollama_max_concurrent,
-            )
-            ollama_clients.append(technical_ollama)
-
-            portfolio_ollama = OllamaClient(
-                base_url=SETTINGS.ollama_base_url,
-                model=SETTINGS.ollama_model,
-                timeout=SETTINGS.ollama_timeout,
-                max_concurrent=SETTINGS.ollama_max_concurrent,
-            )
-            ollama_clients.append(portfolio_ollama)
-
-            trading212 = Trading212Client(
+            runtime = await build_runtime(
                 credentials_path=self.credentials_path,
-                demo_orders_enabled=SETTINGS.demo_orders_enabled,
             )
-
-            market_data_service = MarketDataService(trading212)
-
-            risk_agent = create_risk_agent(technical_ollama)
-
-            agents = [
-                create_technical_agent(technical_ollama),
-                risk_agent,
-                create_portfolio_agent(portfolio_ollama),
-            ]
-
-            orchestrator = AgentOrchestrator(agents)
-
-            decision_agent = DecisionAgent(
-                min_confidence=RISK_LIMITS.min_confidence,
-            )
-
-            risk_manager = RiskManager(
-                max_order_value=RISK_LIMITS.max_order_value,
-                max_position_value=RISK_LIMITS.max_position_value,
-            )
-
-            order_executor = OrderExecutor(
-                trading212=trading212,
-                dry_run=SETTINGS.dry_run,
-            )
-
-            stop_loss_verifier = StopLossVerifier()
 
             logger.info(
                 "TradingBot gestartet | Ticker=%s | Intervall=%ss | "
@@ -406,14 +357,14 @@ class TradingBot:
             while True:
                 try:
                     await self._run_once(
-                        market_data_service=market_data_service,
-                        orchestrator=orchestrator,
-                        decision_agent=decision_agent,
-                        risk_manager=risk_manager,
-                        order_executor=order_executor,
-                        trading212=trading212,
-                        risk_agent=risk_agent,
-                        stop_loss_verifier=stop_loss_verifier,
+                        market_data_service=runtime.market_data_service,
+                        orchestrator=runtime.orchestrator,
+                        decision_agent=runtime.decision_agent,
+                        risk_manager=runtime.risk_manager,
+                        order_executor=runtime.order_executor,
+                        trading212=runtime.trading212,
+                        risk_agent=runtime.risk_agent,
+                        stop_loss_verifier=runtime.stop_loss_verifier,
                     )
 
                 except asyncio.CancelledError:
@@ -437,35 +388,8 @@ class TradingBot:
             raise
 
         finally:
-            try:
-                close_results = await asyncio.gather(
-                    *(client.close() for client in ollama_clients),
-                    return_exceptions=True,
-                )
-
-                for result in close_results:
-                    if isinstance(result, BaseException):
-                        logger.error(
-                            "Ollama-Client konnte nicht sauber "
-                            "geschlossen werden: %s: %s",
-                            type(result).__name__,
-                            result,
-                        )
-
-            finally:
-                if trading212 is not None:
-                    session = getattr(trading212, "session", None)
-
-                    if session is not None:
-                        try:
-                            await asyncio.to_thread(session.close)
-                        except Exception:
-                            logger.exception(
-                                "Trading212-Session konnte nicht "
-                                "sauber geschlossen werden."
-                            )
-
-                logger.info("TradingBot-Ressourcen geschlossen.")
+            if runtime is not None:
+                await runtime.close()
 
 
 if __name__ == "__main__":
