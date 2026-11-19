@@ -8,6 +8,8 @@ from typing import Any
 
 from agents.ollama_client import OllamaClient
 from agents.orchestrator import AgentOrchestrator
+from execution.order_executor import OrderExecutor
+from services.market_data import MarketDataService
 from agents.portfolio import create_portfolio_agent
 from agents.risk import create_risk_agent
 from agents.technical import create_technical_agent
