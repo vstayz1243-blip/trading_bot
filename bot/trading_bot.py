@@ -14,6 +14,7 @@ from agents.technical import create_technical_agent
 from client import Trading212Client
 from execution.order_executor import OrderExecutor
 from services.market_data import MarketDataService
+from services.order_sizing import OrderSizingService
 from services.stop_loss_verifier import StopLossResult, StopLossVerifier
 from strategy.decision import Action, DecisionAgent, TradingDecision
 from strategy.risk_manager import RiskManager
@@ -78,149 +79,6 @@ def print_decision(decision: TradingDecision) -> None:
     print("-" * 60)
 
 
-def prepare_order(
-    decision: TradingDecision,
-    market_data: Any,
-    risk_manager: RiskManager,
-) -> tuple[TradingDecision | None, str]:
-    """
-    Berechnet die Ordermenge und prüft deterministische Risikolimits.
-
-    Führt keine Orders aus.
-    """
-    if decision.action == Action.HOLD:
-        return None, "HOLD - keine Order erforderlich."
-
-    price = market_data.current_price
-    fx_rate = market_data.fx_rate_to_account
-    available_cash = market_data.account_cash
-
-    for name, value in (
-        ("aktueller Kurs", price),
-        ("Wechselkurs", fx_rate),
-        ("verfügbares Guthaben", available_cash),
-    ):
-        if not _is_valid_number(value):
-            return None, f"Ungültiger oder fehlender Wert: {name}."
-
-    if price <= 0:
-        return None, "Der aktuelle Kurs muss größer als null sein."
-
-    if fx_rate <= 0:
-        return None, "Der Wechselkurs muss größer als null sein."
-
-    if available_cash < 0:
-        return None, "Verfügbares Guthaben darf nicht negativ sein."
-
-    account_price = price * fx_rate
-
-    if not _is_valid_number(account_price) or account_price <= 0:
-        return None, "Berechneter Kurs in Kontowährung ist ungültig."
-
-    positions = getattr(market_data, "positions", None)
-
-    if not isinstance(positions, list):
-        return None, "Positionsdaten fehlen oder sind ungültig."
-
-    matching_positions = [
-        position
-        for position in positions
-        if getattr(position, "ticker", None) == decision.ticker
-    ]
-
-    if len(matching_positions) > 1:
-        return None, "Mehrere passende Positionen gefunden."
-
-    position = matching_positions[0] if matching_positions else None
-
-    raw_quantity = (
-        getattr(position, "quantity", None)
-        if position is not None
-        else 0.0
-    )
-
-    if not _is_valid_number(raw_quantity):
-        return None, "Ungültige Menge der bestehenden Position."
-
-    position_quantity = abs(raw_quantity)
-
-    raw_position_price = (
-        getattr(position, "current_price", None)
-        if position is not None
-        else price
-    )
-
-    if (
-        not _is_valid_number(raw_position_price)
-        or raw_position_price <= 0
-    ):
-        return None, "Ungültiger Kurs der bestehenden Position."
-
-    current_position_value = (
-        position_quantity * raw_position_price * fx_rate
-    )
-
-    if (
-        not _is_valid_number(current_position_value)
-        or current_position_value < 0
-    ):
-        return None, "Wert der bestehenden Position ist ungültig."
-
-    if decision.action == Action.BUY:
-        order_value = min(MAX_ORDER_VALUE, available_cash)
-
-        if order_value <= 0:
-            return None, "Kein verfügbares Guthaben für einen Kauf."
-
-        quantity = round(
-            order_value / account_price,
-            QUANTITY_PRECISION,
-        )
-
-    elif decision.action == Action.SELL:
-        if position_quantity <= 0:
-            return None, "Keine bestehende Position zum Verkaufen."
-
-        quantity = round(
-            position_quantity,
-            QUANTITY_PRECISION,
-        )
-
-    else:
-        return None, f"Unbekannte Aktion: {decision.action}"
-
-    if not _is_valid_number(quantity) or quantity <= 0:
-        return None, "Berechnete Ordermenge ist ungültig."
-
-    actual_order_value = quantity * account_price
-
-    if not _is_valid_number(actual_order_value):
-        return None, "Berechneter Orderwert ist ungültig."
-
-    if decision.action == Action.BUY:
-        if actual_order_value > available_cash:
-            return None, "Orderwert überschreitet das verfügbare Guthaben."
-
-        if actual_order_value > MAX_ORDER_VALUE:
-            return None, "Orderwert überschreitet das Orderlimit."
-
-    approved, validation_message = risk_manager.validate(
-        decision=decision,
-        current_price_account_currency=account_price,
-        current_position_value=current_position_value,
-        current_position_quantity=position_quantity,
-        available_cash=available_cash,
-        order_quantity=quantity,
-    )
-
-    if not approved:
-        return None, validation_message
-
-    sized_decision = replace(decision, quantity=quantity)
-
-    return sized_decision, validation_message
-
-
 class TradingBot:
     def __init__(
         self,
@@ -243,6 +101,10 @@ class TradingBot:
         self.credentials_path = credentials_path
         self.interval = interval
         self.ticker = ticker.strip()
+        self.order_sizing_service = OrderSizingService(
+            max_order_value=MAX_ORDER_VALUE,
+            quantity_precision=QUANTITY_PRECISION,
+        )
 
     async def _run_once(
         self,
@@ -457,7 +319,7 @@ class TradingBot:
                 )
                 return
 
-        sized_decision, validation_message = prepare_order(
+        sized_decision, validation_message = self.order_sizing_service.prepare_order(
             decision=decision,
             market_data=market_data,
             risk_manager=risk_manager,
