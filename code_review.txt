@@ -1,0 +1,1372 @@
+import json
+import logging
+import math
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from strategy.decision import Action, TradingDecision
+
+logger = logging.getLogger(__name__)
+
+DEMO_BASE_URL = "https://demo.trading212.com/api/v0"
+STOP_LOSS_DISTANCE = 0.05
+
+ACTIVE_ORDER_STATUSES = {"NEW", "CONFIRMED"}
+STOP_ORDER_TYPES = {"STOP", "STOP_LIMIT"}
+
+
+class OrderExecutionError(RuntimeError):
+    """Orderausführung wurde aus Sicherheitsgründen abgebrochen."""
+
+
+class OrderExecutor:
+    def __init__(
+        self,
+        trading212: Any,
+        dry_run: bool = True,
+        stop_loss_distance: float = STOP_LOSS_DISTANCE,
+        position_wait_attempts: int = 5,
+        position_wait_interval: float = 1.0,
+        state_path: str | Path = "data/order_execution_state.json",
+    ) -> None:
+        if not isinstance(dry_run, bool):
+            raise TypeError("dry_run muss bool sein.")
+
+        if (
+            isinstance(stop_loss_distance, bool)
+            or not isinstance(stop_loss_distance, (int, float))
+            or not math.isfinite(stop_loss_distance)
+            or not 0 < stop_loss_distance < 1
+        ):
+            raise ValueError("stop_loss_distance muss zwischen 0 und 1 liegen.")
+
+        if (
+            isinstance(position_wait_attempts, bool)
+            or not isinstance(position_wait_attempts, int)
+            or position_wait_attempts < 1
+        ):
+            raise ValueError("position_wait_attempts muss mindestens 1 sein.")
+
+        if (
+            isinstance(position_wait_interval, bool)
+            or not isinstance(position_wait_interval, (int, float))
+            or not math.isfinite(position_wait_interval)
+            or position_wait_interval < 0
+        ):
+            raise ValueError("position_wait_interval darf nicht negativ sein.")
+
+        if not isinstance(state_path, (str, Path)):
+            raise TypeError("state_path muss ein String oder Path sein.")
+
+        if not str(state_path).strip():
+            raise ValueError("state_path darf nicht leer sein.")
+
+        self.trading212 = trading212
+        self.dry_run = dry_run
+        self.stop_loss_distance = float(stop_loss_distance)
+        self.position_wait_attempts = position_wait_attempts
+        self.position_wait_interval = float(position_wait_interval)
+        self.state_path = Path(state_path)
+
+    def execute(
+        self,
+        decision: TradingDecision,
+    ) -> dict[str, Any] | None:
+        if decision.action == Action.HOLD:
+            logger.info("HOLD: Keine Order erforderlich.")
+            return None
+
+        if decision.action not in (Action.BUY, Action.SELL):
+            raise ValueError(f"Unbekannte Handelsaktion: {decision.action}")
+
+        ticker = decision.ticker
+        quantity = decision.quantity
+
+        if not isinstance(ticker, str) or not ticker.strip():
+            raise ValueError("Ticker darf nicht leer sein.")
+
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, (int, float))
+            or not math.isfinite(quantity)
+            or quantity <= 0
+        ):
+            raise ValueError("Ordermenge muss positiv und endlich sein.")
+
+        ticker = ticker.strip()
+        quantity = float(quantity)
+
+        if self.dry_run:
+            logger.info(
+                "[DRY-RUN] Keine Order gesendet: %s %.6f %s",
+                decision.action.value,
+                quantity,
+                ticker,
+            )
+            return {
+                "dry_run": True,
+                "ticker": ticker,
+                "action": decision.action.value,
+                "quantity": quantity,
+                "status": "NOT_SUBMITTED",
+            }
+
+        self._require_demo_execution()
+
+        # Eine ungeklärte vorherige Ausführung blockiert alle weiteren Orders.
+        self._ensure_not_blocked()
+
+        if decision.action == Action.BUY:
+            result = self._execute_buy(ticker, quantity)
+        else:
+            result = self._execute_sell(ticker, quantity)
+
+        # Die Sperre wird nur entfernt, wenn die komplette Ausführung
+        # einschließlich der erforderlichen Absicherung erfolgreich war.
+        self._clear_pending()
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Persistenter Ausführungsstatus
+    # ------------------------------------------------------------------
+
+    def _read_execution_state(self) -> dict[str, Any] | None:
+        if not self.state_path.exists():
+            return None
+
+        try:
+            with self.state_path.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrderExecutionError(
+                "Ausführungsstatus kann nicht zuverlässig gelesen werden. "
+                "Orderausführung bleibt gesperrt."
+            ) from exc
+
+        if not isinstance(state, dict):
+            raise OrderExecutionError(
+                "Ausführungsstatus ist ungültig. "
+                "Orderausführung bleibt gesperrt."
+            )
+
+        if state.get("status") != "PENDING_RECONCILIATION":
+            raise OrderExecutionError(
+                "Unbekannter Ausführungsstatus in der Statusdatei. "
+                "Orderausführung bleibt aus Sicherheitsgründen gesperrt."
+            )
+
+        return state
+
+    def _write_execution_state(self, state: dict[str, Any]) -> None:
+        temporary_path = self.state_path.with_name(
+            f"{self.state_path.name}.tmp"
+        )
+
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(
+                    state,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                file.flush()
+                os.fsync(file.fileno())
+
+            # Atomarer Austausch: Die Zieldatei enthält entweder den
+            # vorherigen oder den vollständig geschriebenen Status.
+            os.replace(temporary_path, self.state_path)
+
+        except OSError as exc:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            raise OrderExecutionError(
+                "Ausführungsstatus konnte nicht sicher gespeichert werden. "
+                "Orderausführung wird abgebrochen."
+            ) from exc
+
+    def _ensure_not_blocked(self) -> None:
+        state = self._read_execution_state()
+
+        if state is not None:
+            action = state.get("action", "UNBEKANNT")
+            ticker = state.get("ticker", "UNBEKANNT")
+            stage = state.get("stage", "UNBEKANNT")
+
+            raise OrderExecutionError(
+                "Orderausführung gesperrt: Eine vorherige Ausführung muss "
+                "zuerst manuell abgeglichen werden. "
+                f"Aktion={action}, Ticker={ticker}, Status={stage}. "
+                "Prüfe Positionen und offene Orders bei Trading 212."
+            )
+
+    def _mark_pending(
+        self,
+        action: str,
+        ticker: str,
+        quantity: float,
+        stage: str,
+    ) -> None:
+        self._ensure_not_blocked()
+
+        state = {
+            "status": "PENDING_RECONCILIATION",
+            "action": action,
+            "ticker": ticker,
+            "quantity": quantity,
+            "stage": stage,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        self._write_execution_state(state)
+
+        logger.warning(
+            "Persistente Ausführungssperre gesetzt: "
+            "%s %.6f %s, Status=%s",
+            action,
+            quantity,
+            ticker,
+            stage,
+        )
+
+    def _update_pending_stage(self, stage: str) -> None:
+        state = self._read_execution_state()
+
+        if state is None:
+            raise OrderExecutionError(
+                "Kein persistenter Ausführungsstatus vorhanden. "
+                "Orderausführung wird abgebrochen."
+            )
+
+        state["stage"] = stage
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._write_execution_state(state)
+
+    def _clear_pending(self) -> None:
+        try:
+            self.state_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise OrderExecutionError(
+                "Ausführung war möglicherweise erfolgreich, aber die "
+                "persistente Sperre konnte nicht entfernt werden. "
+                "Prüfe Position und Orders manuell."
+            ) from exc
+
+        logger.info("Persistente Ausführungssperre aufgehoben.")
+
+    # ------------------------------------------------------------------
+    # Allgemeine Sicherheitsprüfungen
+    # ------------------------------------------------------------------
+
+    def _require_demo_execution(self) -> None:
+        base_url = getattr(self.trading212, "base_url", None)
+        orders_enabled = getattr(
+            self.trading212,
+            "demo_orders_enabled",
+            False,
+        )
+
+        if base_url != DEMO_BASE_URL:
+            raise OrderExecutionError(
+                "Sicherheitsabbruch: Nur die Trading-212-Demo-API ist erlaubt."
+            )
+
+        if orders_enabled is not True:
+            raise OrderExecutionError(
+                "Sicherheitsabbruch: Demo-Orderausführung ist nicht freigegeben."
+            )
+
+    def _get_positions(self) -> list[dict[str, Any]]:
+        positions = self.trading212.get_positions()
+
+        if not isinstance(positions, list):
+            raise OrderExecutionError(
+                "Ungültige Antwort bei Positionsabfrage."
+            )
+
+        if not all(isinstance(item, dict) for item in positions):
+            raise OrderExecutionError(
+                "Ungültiger Eintrag in der Positionsliste."
+            )
+
+        return positions
+
+    def _get_orders(self) -> list[dict[str, Any]]:
+        orders = self.trading212.get_pending_orders()
+
+        if not isinstance(orders, list):
+            raise OrderExecutionError(
+                "Ungültige Antwort bei Orderabfrage."
+            )
+
+        if not all(isinstance(item, dict) for item in orders):
+            raise OrderExecutionError(
+                "Ungültiger Eintrag in der Orderliste."
+            )
+
+        return orders
+
+    @staticmethod
+    def _number(value: Any, field: str) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise OrderExecutionError(
+                f"Ungültiger Positionswert: {field}."
+            )
+
+        return float(value)
+
+    def _find_position(
+        self,
+        ticker: str,
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        matches = [
+            position
+            for position in positions
+            if position.get("ticker") == ticker
+        ]
+
+        if len(matches) > 1:
+            raise OrderExecutionError(
+                f"Mehrere Positionseinträge für {ticker}; Abbruch."
+            )
+
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _active_stops(
+        ticker: str,
+        orders: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            order
+            for order in orders
+            if order.get("ticker") == ticker
+            and str(order.get("status", "")).upper()
+            in ACTIVE_ORDER_STATUSES
+            and str(order.get("type", "")).upper()
+            in STOP_ORDER_TYPES
+        ]
+
+    def _wait_for_position(self, ticker: str) -> dict[str, Any]:
+        for attempt in range(self.position_wait_attempts):
+            positions = self._get_positions()
+            position = self._find_position(ticker, positions)
+
+            if position is not None:
+                quantity = self._number(
+                    position.get("quantity"),
+                    "quantity",
+                )
+
+                if quantity != 0:
+                    return position
+
+            if attempt < self.position_wait_attempts - 1:
+                time.sleep(self.position_wait_interval)
+
+        raise OrderExecutionError(
+            f"Position {ticker} nach der Order nicht eindeutig sichtbar. "
+            "Keine weitere Order wird automatisch gesendet."
+        )
+
+    # ------------------------------------------------------------------
+    # Stop-Loss erstellen und verifizieren
+    # ------------------------------------------------------------------
+
+    def _place_and_verify_stop(
+        self,
+        ticker: str,
+        position: dict[str, Any],
+    ) -> dict[str, Any]:
+        quantity = abs(
+            self._number(position.get("quantity"), "quantity")
+        )
+        average_price = self._number(
+            position.get("averagePrice"),
+            "averagePrice",
+        )
+        current_price = self._number(
+            position.get("currentPrice"),
+            "currentPrice",
+        )
+
+        if quantity <= 0 or average_price <= 0 or current_price <= 0:
+            raise OrderExecutionError(
+                "Position hat keine gültigen Mengen- oder Preisdaten."
+            )
+
+        stop_price = round(
+            average_price * (1.0 - self.stop_loss_distance),
+            6,
+        )
+
+        if stop_price >= current_price:
+            raise OrderExecutionError(
+                "Berechneter Stop-Loss liegt nicht unter dem aktuellen Kurs. "
+                "Position muss manuell geprüft werden."
+            )
+
+        existing_orders = self._get_orders()
+        existing_stops = self._active_stops(ticker, existing_orders)
+
+        if existing_stops:
+            raise OrderExecutionError(
+                f"Für {ticker} existiert bereits mindestens eine aktive "
+                "Stop-Order. Keine zusätzliche Stop-Order wird angelegt."
+            )
+
+        logger.info(
+            "Erstelle Stop-Loss: %s, Menge %.6f, Stop-Preis %.6f",
+            ticker,
+            quantity,
+            stop_price,
+        )
+
+        # Status muss vor dem API-Aufruf gespeichert sein. Bei Timeout
+        # bleibt die Sperre auch dann bestehen, wenn die Order serverseitig
+        # bereits angelegt wurde.
+        self._update_pending_stage("SUBMITTING_STOP_LOSS")
+
+        try:
+            created_order = self.trading212.place_stop_order(
+                ticker=ticker,
+                quantity=-quantity,
+                stop_price=stop_price,
+                time_validity="GOOD_TILL_CANCEL",
+            )
+        except Exception:
+            logger.critical(
+                "Stop-Loss-Erstellung für %s fehlgeschlagen oder unklar. "
+                "Position möglicherweise ungeschützt; manuelle Prüfung nötig.",
+                ticker,
+                exc_info=True,
+            )
+            raise
+
+        if not isinstance(created_order, dict):
+            raise OrderExecutionError(
+                "Stop-Order-Antwort ist nicht eindeutig. "
+                "Keine weitere Order wird gesendet."
+            )
+
+        refreshed_orders = self._get_orders()
+        matching_stops = self._active_stops(ticker, refreshed_orders)
+
+        if len(matching_stops) != 1:
+            raise OrderExecutionError(
+                "Stop-Loss konnte nach der Erstellung nicht eindeutig "
+                "verifiziert werden. Manuelle Prüfung erforderlich."
+            )
+
+        verified_order = matching_stops[0]
+
+        from services.stop_loss_verifier import StopLossVerifier
+
+        result = StopLossVerifier().verify(
+            ticker,
+            quantity,
+            current_price,
+            [verified_order],
+        )
+
+        if (
+            getattr(result, "status", None) != "VERIFIED"
+            or getattr(result, "approved", False) is not True
+        ):
+            raise OrderExecutionError(
+                "Stop-Loss-Verifikation fehlgeschlagen: "
+                f"{getattr(result, 'reason', 'Unbekannter Grund')}"
+            )
+
+        logger.info(
+            "Stop-Loss verifiziert: %s bei %.6f",
+            ticker,
+            stop_price,
+        )
+
+        return {
+            "ticker": ticker,
+            "quantity": quantity,
+            "stop_price": stop_price,
+            "status": "VERIFIED",
+            "order": verified_order,
+        }
+
+    # ------------------------------------------------------------------
+    # Kauf
+    # ------------------------------------------------------------------
+
+    def _execute_buy(
+        self,
+        ticker: str,
+        quantity: float,
+    ) -> dict[str, Any]:
+        positions = self._get_positions()
+        existing_position = self._find_position(ticker, positions)
+        orders = self._get_orders()
+
+        if existing_position is not None:
+            existing_quantity = self._number(
+                existing_position.get("quantity"),
+                "quantity",
+            )
+
+            if existing_quantity != 0:
+                raise OrderExecutionError(
+                    f"Für {ticker} besteht bereits eine Position. "
+                    "Zusätzliche Käufe sind gesperrt, bis das Stop-Loss-"
+                    "Management für Positionsaufstockungen implementiert ist."
+                )
+
+        if self._active_stops(ticker, orders):
+            raise OrderExecutionError(
+                f"Für {ticker} existiert bereits eine aktive Stop-Order. "
+                "Kauf wird aus Sicherheitsgründen abgebrochen."
+            )
+
+        # Vor dem mutierenden API-Aufruf dauerhaft sperren.
+        self._mark_pending(
+            action="BUY",
+            ticker=ticker,
+            quantity=quantity,
+            stage="SUBMITTING_MARKET_ORDER",
+        )
+
+        logger.warning(
+            "Demo-Kauforder: %s %.6f",
+            ticker,
+            quantity,
+        )
+
+        # POST-Requests dürfen bei unklarem Status nicht blind wiederholt
+        # werden. Der persistente Status bleibt bei Fehlern erhalten.
+        order = self.trading212.place_market_order(
+            ticker=ticker,
+            quantity=quantity,
+        )
+
+        if not isinstance(order, dict):
+            raise OrderExecutionError(
+                "Kauforder lieferte keine eindeutige Antwort. "
+                "Orderstatus manuell prüfen; nicht erneut senden."
+            )
+
+        self._update_pending_stage("WAITING_FOR_BUY_POSITION")
+
+        try:
+            position = self._wait_for_position(ticker)
+        except Exception:
+            logger.critical(
+                "Kauforder für %s wurde möglicherweise angenommen, aber "
+                "die Position ist nicht eindeutig sichtbar. "
+                "Orderstatus manuell prüfen und keine Kauforder wiederholen.",
+                ticker,
+                exc_info=True,
+            )
+            raise
+
+        try:
+            stop_result = self._place_and_verify_stop(ticker, position)
+        except Exception:
+            logger.critical(
+                "Kauf für %s wurde angenommen, Absicherung ist jedoch "
+                "nicht bestätigt. Keine weiteren Orders automatisch senden.",
+                ticker,
+                exc_info=True,
+            )
+            raise
+
+        return {
+            "action": "BUY",
+            "ticker": ticker,
+            "order": order,
+            "stop_loss": stop_result,
+            "status": "EXECUTED_AND_PROTECTED",
+        }
+
+    # ------------------------------------------------------------------
+    # Verkauf
+    # ------------------------------------------------------------------
+
+    def _execute_sell(
+        self,
+        ticker: str,
+        quantity: float,
+    ) -> dict[str, Any]:
+        positions = self._get_positions()
+        position = self._find_position(ticker, positions)
+
+        if position is None:
+            raise OrderExecutionError(
+                f"Keine Position für {ticker}; Verkauf abgebrochen."
+            )
+
+        position_quantity = abs(
+            self._number(position.get("quantity"), "quantity")
+        )
+
+        if position_quantity <= 0:
+            raise OrderExecutionError(
+                f"Position für {ticker} hat keine verkaufbare Menge."
+            )
+
+        if quantity > position_quantity + 1e-9:
+            raise OrderExecutionError(
+                "Verkaufsmenge überschreitet die vorhandene Position."
+            )
+
+        orders = self._get_orders()
+        active_stops = self._active_stops(ticker, orders)
+
+        if len(active_stops) > 1:
+            raise OrderExecutionError(
+                f"Mehrere aktive Stop-Orders für {ticker}; "
+                "manuelle Bereinigung erforderlich."
+            )
+
+        if active_stops:
+            stop_order = active_stops[0]
+            order_id = stop_order.get("id")
+
+            if (
+                isinstance(order_id, bool)
+                or not isinstance(order_id, int)
+                or order_id <= 0
+            ):
+                raise OrderExecutionError(
+                    "Stop-Order hat keine gültige ID. Verkauf abgebrochen."
+                )
+
+            # Bereits die Stornierung verändert den Kontozustand. Deshalb
+            # muss die Sperre davor dauerhaft gesetzt werden.
+            self._mark_pending(
+                action="SELL",
+                ticker=ticker,
+                quantity=quantity,
+                stage="CANCELLING_STOP_LOSS",
+            )
+
+            self.trading212.cancel_order(order_id)
+
+            remaining_stops = self._active_stops(
+                ticker,
+                self._get_orders(),
+            )
+
+            if any(
+                item.get("id") == order_id
+                for item in remaining_stops
+            ):
+                raise OrderExecutionError(
+                    "Stop-Order-Stornierung konnte nicht bestätigt werden. "
+                    "Verkauf wird nicht gesendet."
+                )
+
+            self._update_pending_stage("SUBMITTING_MARKET_SELL")
+
+        else:
+            # Auch ohne vorhandenen Stop muss vor dem Verkauf gesperrt werden.
+            self._mark_pending(
+                action="SELL",
+                ticker=ticker,
+                quantity=quantity,
+                stage="SUBMITTING_MARKET_SELL",
+            )
+
+        logger.warning(
+            "Demo-Verkaufsorder: %s %.6f",
+            ticker,
+            quantity,
+        )
+
+        order = self.trading212.place_market_order(
+            ticker=ticker,
+            quantity=-quantity,
+        )
+
+        if not isinstance(order, dict):
+            raise OrderExecutionError(
+                "Verkaufsorder lieferte keine eindeutige Antwort. "
+                "Orderstatus manuell prüfen."
+            )
+
+        self._update_pending_stage("VERIFYING_REMAINING_POSITION")
+
+        refreshed_positions = self._get_positions()
+        remaining_position = self._find_position(
+            ticker,
+            refreshed_positions,
+        )
+
+        if remaining_position is not None:
+            remaining_quantity = abs(
+                self._number(
+                    remaining_position.get("quantity"),
+                    "quantity",
+                )
+            )
+
+            if remaining_quantity > 1e-9:
+                try:
+                    self._place_and_verify_stop(
+                        ticker,
+                        remaining_position,
+                    )
+                except Exception:
+                    logger.critical(
+                        "Verkauf für %s wurde angenommen, aber die "
+                        "verbliebene Position ist möglicherweise ungeschützt.",
+                        ticker,
+                        exc_info=True,
+                    )
+                    raise
+
+        return {
+            "action": "SELL",
+            "ticker": ticker,
+            "order": order,
+            "status": "EXECUTED",
+        }
+from dataclasses import dataclass
+from math import isfinite
+from typing import Any
+
+
+@dataclass(frozen=True)
+class StopLossResult:
+    status: str
+    approved: bool
+    reason: str
+
+
+class StopLossVerifier:
+    ACTIVE_STATUSES = {"NEW", "CONFIRMED"}
+    STOP_ORDER_TYPES = {"STOP", "STOP_LIMIT"}
+
+    @staticmethod
+    def _valid_number(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(value)
+        )
+
+    def verify(
+        self,
+        ticker: str,
+        position_quantity: float,
+        current_price: float,
+        orders: list[dict[str, Any]],
+    ) -> StopLossResult:
+        if not isinstance(ticker, str) or not ticker.strip():
+            return self._unknown("Ticker ungültig.")
+
+        if (
+            not self._valid_number(position_quantity)
+            or position_quantity <= 0
+        ):
+            return self._unknown(
+                "Keine gültige bestehende Position vorhanden."
+            )
+
+        if not self._valid_number(current_price) or current_price <= 0:
+            return self._unknown("Aktueller Kurs ungültig.")
+
+        if not isinstance(orders, list):
+            return self._unknown("Orderliste ungültig.")
+
+        candidates = []
+
+        for order in orders:
+            if not isinstance(order, dict):
+                return self._unknown("Ungültiger Order-Eintrag.")
+
+            if order.get("ticker") != ticker:
+                continue
+
+            order_type = order.get("type")
+            status = order.get("status")
+
+            if not isinstance(order_type, str) or not isinstance(status, str):
+                return self._unknown(
+                    "Ordertyp oder Status fehlt."
+                )
+
+            if (
+                order_type.upper() in self.STOP_ORDER_TYPES
+                and status.upper() in self.ACTIVE_STATUSES
+            ):
+                candidates.append(order)
+
+        if not candidates:
+            return self._missing(
+                "Keine passende aktive Stop-Order gefunden."
+            )
+
+        if len(candidates) != 1:
+            return self._unknown(
+                "Mehrere aktive Stop-Orders gefunden."
+            )
+
+        order = candidates[0]
+
+        quantity = order.get("quantity")
+        filled_quantity = order.get("filledQuantity", 0)
+        stop_price = order.get("stopPrice")
+        side = order.get("side")
+
+        if (
+            not self._valid_number(quantity)
+            or not self._valid_number(filled_quantity)
+            or not self._valid_number(stop_price)
+            or not isinstance(side, str)
+        ):
+            return self._unknown(
+                "Stop-Order enthält unvollständige oder ungültige Daten."
+            )
+
+        if side.upper() != "SELL" or quantity >= 0:
+            return self._unknown(
+                "Stop-Order ist keine gültige Verkaufsorder."
+            )
+
+        if stop_price <= 0 or stop_price >= current_price:
+            return self._unknown(
+                "Stop-Preis muss positiv und unter dem aktuellen Kurs liegen."
+            )
+
+        remaining_quantity = abs(quantity) - abs(filled_quantity)
+
+        if remaining_quantity <= 0:
+            return self._missing(
+                "Die Stop-Order hat keine verbleibende Schutzmenge."
+            )
+
+        if remaining_quantity + 1e-9 < position_quantity:
+            return self._missing(
+                "Die Stop-Order deckt die Position nicht vollständig ab."
+            )
+
+        return StopLossResult(
+            status="VERIFIED",
+            approved=True,
+            reason=(
+                f"Aktive Verkaufs-Stop-Order verifiziert: "
+                f"{remaining_quantity:g} von "
+                f"{position_quantity:g} Stück abgesichert."
+            ),
+        )
+
+    @staticmethod
+    def _unknown(reason: str) -> StopLossResult:
+        return StopLossResult("UNKNOWN", False, reason)
+
+    @staticmethod
+    def _missing(reason: str) -> StopLossResult:
+        return StopLossResult("MISSING", False, reason)
+
+import json
+import time
+from math import isfinite
+from pathlib import Path
+from typing import Any
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+from client.exceptions import (
+    Trading212AuthenticationError,
+    Trading212APIError,
+    Trading212ConnectionError,
+    Trading212OrderStatusUnknown,
+)
+
+
+DEMO_BASE_URL = "https://demo.trading212.com/api/v0"
+
+
+class Trading212Client:
+    """
+    Trading-212-Client für das Demokonto.
+
+    Live-API-URLs werden grudef _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
+    url = f"{self.base_url}/{endpoint.lstrip('/')}"
+    method = method.upper()
+
+    # Nur GET darf automatisch wiederholt werden.
+    retryable = method == "GET"
+    attempts = self.max_retries + 1 if retryable else 1
+
+    for attempt in range(attempts):
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                timeout=30,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            if retryable:
+                raise Trading212ConnectionError(
+                    "Verbindung zu Trading 212 fehlgeschlagen."
+                ) from exc
+
+            raise Trading212OrderStatusUnknown(
+                f"{method} {endpoint}: Verbindung unterbrochen. "
+                "Der Ausgang der Anfrage ist unklar. "
+                "Vor weiteren Orders den tatsächlichen Status prüfen."
+            ) from exc
+
+        if response.status_code == 429:
+            if attempt >= attempts - 1:
+                raise Trading212APIError(
+                    "Trading-212-Rate-Limit weiterhin aktiv."
+                )
+
+            retry_after = response.headers.get("Retry-After")
+
+            try:
+                wait_seconds = (
+                    max(0.0, float(retry_after))
+                    if retry_after is not None
+                    else 5.0 * (2 ** attempt)
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 5.0
+
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code in (401, 403):
+            raise Trading212AuthenticationError(
+                "Trading-212-Authentifizierung fehlgeschlagen."
+            )
+
+        if not response.ok:
+            # Ein Serverfehler bei POST/DELETE kann auftreten,
+            # obwohl die Aktion serverseitig bereits ausgeführt wurde.
+            if not retryable and response.status_code >= 500:
+                raise Trading212OrderStatusUnknown(
+                    f"{method} {endpoint}: HTTP "
+                    f"{response.status_code}. Der Ausgang der Anfrage "
+                    "ist unklar; keine automatische Wiederholung."
+                )
+
+            raise Trading212APIError(
+                f"Trading 212 API antwortete mit "
+                f"{response.status_code}: {response.text}"
+            )
+
+        if not response.content:
+            return None
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            if not retryable:
+                raise Trading212OrderStatusUnknown(
+                    f"{method} {endpoint}: Erfolgreiche HTTP-Antwort, "
+                    "aber ungültiges JSON. Der Ausgang der Aktion "
+                    "muss geprüft werden."
+                ) from exc
+
+            raise Trading212APIError(
+                "Trading 212 lieferte ungültiges JSON."
+            ) from exc
+
+    raise Trading212APIError(
+        "Trading-212-Anfrage unerwartet fehlgeschlagen."
+    )ndsätzlich abgelehnt.
+    Orderausführung muss zusätzlich explizit freigeschaltet werden.
+    """
+
+    def __init__(
+        self,
+        credentials_path: str = "credentials.json",
+        base_url: str = DEMO_BASE_URL,
+        max_retries: int = 3,
+        demo_orders_enabled: bool = False,
+    ) -> None:
+        normalized_url = base_url.rstrip("/")
+
+        if normalized_url != DEMO_BASE_URL:
+            raise ValueError(
+                "Sicherheitsabbruch: Dieser Client erlaubt ausschließlich "
+                "die Trading-212-Demo-API."
+            )
+
+        if not isinstance(demo_orders_enabled, bool):
+            raise TypeError("demo_orders_enabled muss bool sein.")
+
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries muss eine nicht-negative Ganzzahl sein.")
+
+        self.base_url = normalized_url
+        self.credentials_path = Path(credentials_path)
+        self.max_retries = max_retries
+        self.demo_orders_enabled = demo_orders_enabled
+
+        self.session = requests.Session()
+        self._load_credentials()
+
+    # ---------------------------------------------------------
+    # Credentials
+    # ---------------------------------------------------------
+
+    def _load_credentials(self) -> None:
+        if not self.credentials_path.exists():
+            raise FileNotFoundError(
+                f"Credentials file not found: {self.credentials_path}"
+            )
+
+        try:
+            with self.credentials_path.open("r", encoding="utf-8") as file:
+                credentials = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "credentials.json enthält ungültiges JSON."
+            ) from exc
+
+        if not isinstance(credentials, dict):
+            raise ValueError(
+                "credentials.json muss ein JSON-Objekt enthalten."
+            )
+
+        try:
+            api_key = credentials["key"]
+            api_secret = credentials["secret"]
+        except KeyError as exc:
+            raise ValueError(
+                "credentials.json muss 'key' und 'secret' enthalten."
+            ) from exc
+
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("Der API-Key ist ungültig.")
+
+        if not isinstance(api_secret, str) or not api_secret.strip():
+            raise ValueError("Das API-Secret ist ungültig.")
+
+        self.session.auth = HTTPBasicAuth(api_key, api_secret)
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+
+    # ---------------------------------------------------------
+    # HTTP Request
+    # ---------------------------------------------------------
+
+def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
+    url = f"{self.base_url}/{endpoint.lstrip('/')}"
+    method = method.upper()
+
+    # Nur GET darf automatisch wiederholt werden.
+    retryable = method == "GET"
+    attempts = self.max_retries + 1 if retryable else 1
+
+    for attempt in range(attempts):
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                timeout=30,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            if retryable:
+                raise Trading212ConnectionError(
+                    "Verbindung zu Trading 212 fehlgeschlagen."
+                ) from exc
+
+            raise Trading212OrderStatusUnknown(
+                f"{method} {endpoint}: Verbindung unterbrochen. "
+                "Der Ausgang der Anfrage ist unklar. "
+                "Vor weiteren Orders den tatsächlichen Status prüfen."
+            ) from exc
+
+        if response.status_code == 429:
+            if attempt >= attempts - 1:
+                raise Trading212APIError(
+                    "Trading-212-Rate-Limit weiterhin aktiv."
+                )
+
+            retry_after = response.headers.get("Retry-After")
+
+            try:
+                wait_seconds = (
+                    max(0.0, float(retry_after))
+                    if retry_after is not None
+                    else 5.0 * (2 ** attempt)
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 5.0
+
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code in (401, 403):
+            raise Trading212AuthenticationError(
+                "Trading-212-Authentifizierung fehlgeschlagen."
+            )
+
+        if not response.ok:
+            # Ein Serverfehler bei POST/DELETE kann auftreten,
+            # obwohl die Aktion serverseitig bereits ausgeführt wurde.
+            if not retryable and response.status_code >= 500:
+                raise Trading212OrderStatusUnknown(
+                    f"{method} {endpoint}: HTTP "
+                    f"{response.status_code}. Der Ausgang der Anfrage "
+                    "ist unklar; keine automatische Wiederholung."
+                )
+
+            raise Trading212APIError(
+                f"Trading 212 API antwortete mit "
+                f"{response.status_code}: {response.text}"
+            )
+
+        if not response.content:
+            return None
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            if not retryable:
+                raise Trading212OrderStatusUnknown(
+                    f"{method} {endpoint}: Erfolgreiche HTTP-Antwort, "
+                    "aber ungültiges JSON. Der Ausgang der Aktion "
+                    "muss geprüft werden."
+                ) from exc
+
+            raise Trading212APIError(
+                "Trading 212 lieferte ungültiges JSON."
+            ) from exc
+
+    raise Trading212APIError(
+        "Trading-212-Anfrage unerwartet fehlgeschlagen."
+    )
+    # ---------------------------------------------------------
+    # HTTP Methods
+    # ---------------------------------------------------------
+
+    def get(self, endpoint: str, **kwargs: Any) -> Any:
+        return self._request("GET", endpoint, **kwargs)
+
+    def post(self, endpoint: str, **kwargs: Any) -> Any:
+        return self._request("POST", endpoint, **kwargs)
+
+    def delete(self, endpoint: str, **kwargs: Any) -> Any:
+        return self._request("DELETE", endpoint, **kwargs)
+
+    # ---------------------------------------------------------
+    # Account / Instruments / Positions
+    # ---------------------------------------------------------
+
+    def get_account_summary(self) -> dict[str, Any]:
+        account = self.get("/equity/account/summary")
+
+        if not isinstance(account, dict):
+            raise Trading212APIError(
+                "Trading 212 lieferte keine gültigen Kontodaten."
+            )
+
+        return account
+
+    def get_instruments(self) -> list[dict[str, Any]]:
+        instruments = self.get("/equity/metadata/instruments")
+
+        if not isinstance(instruments, list):
+            raise Trading212APIError(
+                "Trading 212 lieferte keine gültige Instrumentenliste."
+            )
+
+        return instruments
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        positions = self.get("/equity/positions")
+
+        if not isinstance(positions, list):
+            raise Trading212APIError(
+                "Trading 212 lieferte keine gültige Positionsliste."
+            )
+
+        if not all(isinstance(item, dict) for item in positions):
+            raise Trading212APIError(
+                "Die Positionsliste enthält ungültige Einträge."
+            )
+
+        return positions
+
+    def get_pending_orders(self) -> list[dict[str, Any]]:
+        orders = self.get("/equity/orders")
+
+        if not isinstance(orders, list):
+            raise Trading212APIError(
+                "Trading 212 lieferte keine gültige Liste offener Orders."
+            )
+
+        if not all(isinstance(order, dict) for order in orders):
+            raise Trading212APIError(
+                "Die Orderliste enthält ungültige Einträge."
+            )
+
+        return orders
+
+    # ---------------------------------------------------------
+    # Order Safety
+    # ---------------------------------------------------------
+
+    def _require_demo_order_permission(self) -> None:
+        if self.base_url != DEMO_BASE_URL:
+            raise RuntimeError(
+                "Sicherheitsabbruch: keine Demo-API."
+            )
+
+        if not self.demo_orders_enabled:
+            raise RuntimeError(
+                "Order blockiert: Demo-Orderausführung ist nicht freigeschaltet."
+            )
+
+    @staticmethod
+    def _validate_ticker(ticker: str) -> None:
+        if not isinstance(ticker, str) or not ticker.strip():
+            raise ValueError("Ticker darf nicht leer sein.")
+
+    @staticmethod
+    def _validate_quantity(quantity: float, allow_negative: bool = True) -> None:
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, (int, float))
+            or not isfinite(quantity)
+            or quantity == 0
+        ):
+            raise ValueError("Quantity muss eine endliche Zahl ungleich 0 sein.")
+
+        if not allow_negative and quantity < 0:
+            raise ValueError("Quantity darf nicht negativ sein.")
+
+    def place_market_order(
+        self,
+        ticker: str,
+        quantity: float,
+        extended_hours: bool = False,
+    ) -> dict[str, Any]:
+        self._require_demo_order_permission()
+        self._validate_ticker(ticker)
+        self._validate_quantity(quantity)
+
+        if not isinstance(extended_hours, bool):
+            raise TypeError("extended_hours muss bool sein.")
+
+        payload = {
+            "ticker": ticker,
+            "quantity": quantity,
+            "extendedHours": extended_hours,
+        }
+
+        result = self.post("/equity/orders/market", json=payload)
+
+        if not isinstance(result, dict):
+            raise Trading212APIError(
+                "Marktorder lieferte keine eindeutige JSON-Orderantwort."
+            )
+
+        return result
+
+    def place_stop_order(
+        self,
+        ticker: str,
+        quantity: float,
+        stop_price: float,
+        time_validity: str = "GOOD_TILL_CANCEL",
+    ) -> dict[str, Any]:
+        self._require_demo_order_permission()
+        self._validate_ticker(ticker)
+        self._validate_quantity(quantity)
+
+        if quantity >= 0:
+            raise ValueError(
+                "Eine Stop-Loss-Verkaufsorder benötigt eine negative Menge."
+            )
+
+        if (
+            isinstance(stop_price, bool)
+            or not isinstance(stop_price, (int, float))
+            or not isfinite(stop_price)
+            or stop_price <= 0
+        ):
+            raise ValueError("Stop-Preis muss positiv und endlich sein.")
+
+        if time_validity not in {"DAY", "GOOD_TILL_CANCEL"}:
+            raise ValueError("Ungültige time_validity.")
+
+        payload = {
+            "ticker": ticker,
+            "quantity": quantity,
+            "stopPrice": stop_price,
+            "timeValidity": time_validity,
+        }
+
+        result = self.post("/equity/orders/stop", json=payload)
+
+        if not isinstance(result, dict):
+            raise Trading212APIError(
+                "Stop-Order lieferte keine eindeutige JSON-Orderantwort."
+            )
+
+        return result
+
+    def cancel_order(self, order_id: int) -> Any:
+        self._require_demo_order_permission()
+
+        if (
+            isinstance(order_id, bool)
+            or not isinstance(order_id, int)
+            or order_id <= 0
+        ):
+            raise ValueError("Order-ID muss eine positive Ganzzahl sein.")
+
+        return self.delete(f"/equity/orders/{order_id}")
+
+    # ---------------------------------------------------------
+    # Cleanup
+    # ---------------------------------------------------------
+
+    def close(self) -> None:
+        self.session.close()
+class Trading212Error(Exception):
+    """Basisklasse für Trading-212-Fehler."""
+
+
+class Trading212AuthenticationError(Trading212Error):
+    """Authentifizierung fehlgeschlagen."""
+
+
+class Trading212APIError(Trading212Error):
+    """Die API hat eine Anfrage abgelehnt oder einen Fehler gemeldet."""
+
+
+class Trading212ConnectionError(Trading212Error):
+    """Trading 212 konnte nicht erreicht werden."""
+
+
+class Trading212OrderStatusUnknown(Trading212ConnectionError):
+    """Eine schreibende Anfrage wurde gesendet, ihr Ergebnis ist unklar."""
