@@ -21,14 +21,18 @@ class FakeOllama:
 
 
 class FakeTrading212:
+    instances = []
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.session = Mock()
+        self.__class__.instances.append(self)
 
 
 @pytest.fixture(autouse=True)
 def reset_fake_clients():
     FakeOllama.instances = []
+    FakeTrading212.instances = []
 
 
 def patch_runtime_dependencies(monkeypatch):
@@ -156,3 +160,27 @@ def test_build_runtime_closes_created_clients_if_initialization_fails(
 
     assert len(FakeOllama.instances) == 1
     assert FakeOllama.instances[0].close_calls == 1
+
+
+def test_build_runtime_closes_all_resources_if_later_setup_fails(monkeypatch):
+    patch_runtime_dependencies(monkeypatch)
+
+    def fail_market_data_service(trading212):
+        raise RuntimeError("Market data setup failed")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "MarketDataService",
+        fail_market_data_service,
+    )
+
+    with pytest.raises(RuntimeError, match="Market data setup failed"):
+        asyncio.run(
+            runtime_module.build_runtime("test-credentials.json")
+        )
+
+    assert len(FakeOllama.instances) == 2
+    assert all(client.close_calls == 1 for client in FakeOllama.instances)
+
+    assert len(FakeTrading212.instances) == 1
+    FakeTrading212.instances[0].session.close.assert_called_once()
