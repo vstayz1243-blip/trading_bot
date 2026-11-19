@@ -344,18 +344,18 @@ class TradingBot:
 
         try:
             technical_ollama = OllamaClient(
-                base_url="http://localhost:11434",
-                model="qwen3:8b",
-                timeout=300.0,
-                max_concurrent=1,
+                base_url=SETTINGS.ollama_base_url,
+                model=SETTINGS.ollama_model,
+                timeout=SETTINGS.ollama_timeout,
+                max_concurrent=SETTINGS.ollama_max_concurrent,
             )
             ollama_clients.append(technical_ollama)
 
             portfolio_ollama = OllamaClient(
-                base_url="http://localhost:11434",
-                model="qwen3:8b",
-                timeout=300.0,
-                max_concurrent=1,
+                base_url=SETTINGS.ollama_base_url,
+                model=SETTINGS.ollama_model,
+                timeout=SETTINGS.ollama_timeout,
+                max_concurrent=SETTINGS.ollama_max_concurrent,
             )
             ollama_clients.append(portfolio_ollama)
 
@@ -387,14 +387,14 @@ class TradingBot:
 
             order_executor = OrderExecutor(
                 trading212=trading212,
-                dry_run=True,
+                dry_run=SETTINGS.dry_run,
             )
 
             stop_loss_verifier = StopLossVerifier()
 
             logger.info(
                 "TradingBot gestartet | Ticker=%s | Intervall=%ss | "
-                "SETTINGS.dry_run=%s | SETTINGS.demo_orders_enabled=%s",
+                "DRY_RUN=%s | DEMO_ORDERS_ENABLED=%s",
                 self.ticker,
                 self.interval,
                 SETTINGS.dry_run,
