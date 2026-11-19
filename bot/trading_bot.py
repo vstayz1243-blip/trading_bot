@@ -12,6 +12,8 @@ from agents.portfolio import create_portfolio_agent
 from agents.risk import create_risk_agent
 from agents.technical import create_technical_agent
 from client import Trading212Client
+from config.risk_limits import RISK_LIMITS
+from config.settings import SETTINGS
 from execution.order_executor import OrderExecutor
 from services.market_data import MarketDataService
 from services.order_sizing import OrderSizingService
@@ -21,19 +23,6 @@ from strategy.risk_manager import RiskManager
 
 
 logger = logging.getLogger(__name__)
-
-MIN_CONFIDENCE = 0.65
-MAX_ORDER_VALUE = 500.0
-MAX_POSITION_VALUE = 1000.0
-QUANTITY_PRECISION = 6
-
-# Sicherheitskonfiguration:
-# Es werden standardmäßig keine Orders an Trading 212 gesendet.
-DRY_RUN = True
-
-# Zusätzliche Freigabe für Demo-Orders.
-# Bleibt deaktiviert, bis API-Antworten und Tests geprüft wurden.
-DEMO_ORDERS_ENABLED = False
 
 
 def _is_valid_number(value: Any) -> bool:
@@ -102,8 +91,8 @@ class TradingBot:
         self.interval = interval
         self.ticker = ticker.strip()
         self.order_sizing_service = OrderSizingService(
-            max_order_value=MAX_ORDER_VALUE,
-            quantity_precision=QUANTITY_PRECISION,
+            max_order_value=RISK_LIMITS.max_order_value,
+            quantity_precision=RISK_LIMITS.quantity_precision,
         )
 
     async def _run_once(
@@ -334,7 +323,7 @@ class TradingBot:
         print_decision(sized_decision)
 
         # Die aktuelle Version erlaubt ausschließlich Dry-Run.
-        if DRY_RUN is not True:
+        if SETTINGS.dry_run is not True:
             raise RuntimeError(
                 "Sicherheitsabbruch: Orderausführung ist in dieser "
                 "Version gesperrt."
@@ -372,7 +361,7 @@ class TradingBot:
 
             trading212 = Trading212Client(
                 credentials_path=self.credentials_path,
-                demo_orders_enabled=DEMO_ORDERS_ENABLED,
+                demo_orders_enabled=SETTINGS.demo_orders_enabled,
             )
 
             market_data_service = MarketDataService(trading212)
@@ -388,12 +377,12 @@ class TradingBot:
             orchestrator = AgentOrchestrator(agents)
 
             decision_agent = DecisionAgent(
-                min_confidence=MIN_CONFIDENCE,
+                min_confidence=RISK_LIMITS.min_confidence,
             )
 
             risk_manager = RiskManager(
-                max_order_value=MAX_ORDER_VALUE,
-                max_position_value=MAX_POSITION_VALUE,
+                max_order_value=RISK_LIMITS.max_order_value,
+                max_position_value=RISK_LIMITS.max_position_value,
             )
 
             order_executor = OrderExecutor(
@@ -405,11 +394,11 @@ class TradingBot:
 
             logger.info(
                 "TradingBot gestartet | Ticker=%s | Intervall=%ss | "
-                "DRY_RUN=%s | DEMO_ORDERS_ENABLED=%s",
+                "SETTINGS.dry_run=%s | SETTINGS.demo_orders_enabled=%s",
                 self.ticker,
                 self.interval,
-                DRY_RUN,
-                DEMO_ORDERS_ENABLED,
+                SETTINGS.dry_run,
+                SETTINGS.demo_orders_enabled,
             )
 
             while True:
