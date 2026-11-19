@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import math
@@ -7,8 +6,6 @@ from dataclasses import replace
 from typing import Any
 
 from agents.orchestrator import AgentOrchestrator
-from execution.order_executor import OrderExecutor
-from services.market_data import MarketDataService
 from bot.runtime import BotRuntime, build_runtime
 from client import Trading212Client
 from config.risk_limits import RISK_LIMITS
