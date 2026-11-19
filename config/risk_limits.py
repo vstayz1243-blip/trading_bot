@@ -26,16 +26,21 @@ class RiskLimits:
 
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ValueError("min_confidence must be between 0 and 1.")
+
         if self.max_order_value <= 0:
             raise ValueError("max_order_value must be positive.")
+
         if self.max_position_value <= 0:
             raise ValueError("max_position_value must be positive.")
+
         if (
             isinstance(self.quantity_precision, bool)
             or not isinstance(self.quantity_precision, int)
             or self.quantity_precision < 0
         ):
-            raise ValueError("quantity_precision must be a non-negative integer.")
+            raise ValueError(
+                "quantity_precision must be a non-negative integer."
+            )
 
 
 RISK_LIMITS = RiskLimits()
