@@ -71,9 +71,9 @@ def print_decision(decision: TradingDecision) -> None:
 class TradingBot:
     def __init__(
         self,
-        credentials_path: str = "credentials.json",
-        interval: int = 300,
-        ticker: str = "AAPL_US_EQ",
+        credentials_path: str = SETTINGS.credentials_path,
+        interval: int = SETTINGS.default_interval,
+        ticker: str = SETTINGS.default_ticker,
     ) -> None:
         if (
             isinstance(interval, bool)
