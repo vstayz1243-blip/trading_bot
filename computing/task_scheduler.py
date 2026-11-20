@@ -89,12 +89,19 @@ class TaskScheduler:
             if task is None or task.status is TaskStatus.CANCELLED:
                 continue
 
+            active_tasks = [self._tasks[item] for item in self._active]
             active_cpu = sum(
-                1 for item in self._active
-                if self._tasks[item].task_type in self.worker_manager.CPU_TASK_TYPES
+                active_task.task_type in self.worker_manager.CPU_TASK_TYPES
+                for active_task in active_tasks
             )
-            active_llm = len(self._active) - active_cpu
-            active_total = len(self._active)
+            active_llm = len(active_tasks) - active_cpu
+            active_reserved_memory_mb = sum(
+                self.resource_manager.estimate_task_memory_mb(
+                    active_task.task_type,
+                    active_task.metadata,
+                )
+                for active_task in active_tasks
+            )
 
             try:
                 can_start = await asyncio.to_thread(
@@ -102,11 +109,18 @@ class TaskScheduler:
                     task.task_type,
                     active_cpu,
                     active_llm,
-                    active_total,
+                    len(active_tasks),
+                    task.metadata,
+                    active_reserved_memory_mb,
                 )
             except Exception:
                 logger.exception("Resource check failed; task remains queued.")
                 can_start = False
+
+            # A queued task can be cancelled while the resource check runs
+            # in a helper thread. Re-check before dispatching it.
+            if task.status is TaskStatus.CANCELLED:
+                continue
 
             if not can_start:
                 await self._queue.put(

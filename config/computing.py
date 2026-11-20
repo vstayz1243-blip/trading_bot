@@ -12,12 +12,23 @@ class ComputingSettings:
     max_total_tasks: int = 4
     max_memory_usage_percent: float = 80.0
     max_cpu_usage_percent: float = 95.0
+    default_cpu_task_memory_mb: int = 256
+    heavy_cpu_task_memory_mb: int = 2048
+    llm_task_memory_mb: int = 512
     resource_check_interval: float = 0.5
     ollama_timeout: float = 300.0
     llm_retries: int = 1
 
     def __post_init__(self) -> None:
-        for name in ("max_cpu_workers", "max_llm_parallel", "max_total_tasks"):
+        integer_fields = (
+            "max_cpu_workers",
+            "max_llm_parallel",
+            "max_total_tasks",
+            "default_cpu_task_memory_mb",
+            "heavy_cpu_task_memory_mb",
+            "llm_task_memory_mb",
+        )
+        for name in integer_fields:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer.")
@@ -67,6 +78,13 @@ class ComputingSettings:
             max_cpu_usage_percent=float(
                 os.getenv("MAX_CPU_USAGE_PERCENT", "95")
             ),
+            default_cpu_task_memory_mb=int(
+                os.getenv("DEFAULT_CPU_TASK_MEMORY_MB", "256")
+            ),
+            heavy_cpu_task_memory_mb=int(
+                os.getenv("HEAVY_CPU_TASK_MEMORY_MB", "2048")
+            ),
+            llm_task_memory_mb=int(os.getenv("LLM_TASK_MEMORY_MB", "512")),
             resource_check_interval=float(
                 os.getenv("COMPUTING_RESOURCE_CHECK_INTERVAL", "0.5")
             ),

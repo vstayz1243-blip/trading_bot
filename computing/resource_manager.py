@@ -35,9 +35,35 @@ class ResourceManager:
         TaskType.TECHNICAL_ANALYSIS,
         TaskType.PORTFOLIO_ANALYSIS,
     }
+    HEAVY_TASK_TYPES = {
+        TaskType.BACKTEST,
+        TaskType.STRATEGY_OPTIMIZATION,
+    }
 
     def __init__(self, settings: ComputingSettings = COMPUTING_SETTINGS):
         self.settings = settings
+
+    def estimate_task_memory_mb(
+        self,
+        task_type: TaskType,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Return a conservative reservation; callers may provide an estimate."""
+        metadata = metadata or {}
+        estimate = metadata.get("estimated_memory_mb")
+        if estimate is not None:
+            if (
+                isinstance(estimate, bool)
+                or not isinstance(estimate, int)
+                or estimate < 1
+            ):
+                raise ValueError("estimated_memory_mb must be a positive integer.")
+            return estimate
+        if task_type in self.HEAVY_TASK_TYPES:
+            return self.settings.heavy_cpu_task_memory_mb
+        if task_type is TaskType.AI_ANALYSIS:
+            return self.settings.llm_task_memory_mb
+        return self.settings.default_cpu_task_memory_mb
 
     def get_snapshot(
         self,
@@ -67,6 +93,8 @@ class ResourceManager:
         active_cpu_workers: int,
         active_llm_requests: int,
         active_tasks: int,
+        task_metadata: dict[str, Any] | None = None,
+        active_reserved_memory_mb: int = 0,
     ) -> bool:
         if active_tasks >= self.settings.max_total_tasks:
             return False
@@ -77,6 +105,21 @@ class ResourceManager:
             active_tasks=active_tasks,
         )
         if snapshot.memory_percent >= self.settings.max_memory_usage_percent:
+            return False
+
+        memory_budget = (
+            snapshot.memory_total_bytes
+            * self.settings.max_memory_usage_percent
+            / 100
+        )
+        memory_in_use = snapshot.memory_total_bytes - snapshot.memory_available_bytes
+        reserved = active_reserved_memory_mb * 1024 * 1024
+        incoming = (
+            self.estimate_task_memory_mb(task_type, task_metadata)
+            * 1024
+            * 1024
+        )
+        if memory_budget - memory_in_use - reserved < incoming:
             return False
 
         if task_type in self.CPU_TASK_TYPES:

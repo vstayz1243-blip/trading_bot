@@ -63,6 +63,13 @@ class Task:
             self.priority = TaskPriority(self.priority)
         if not isinstance(self.metadata, dict):
             raise TypeError("metadata must be a dictionary.")
+        estimate = self.metadata.get("estimated_memory_mb")
+        if estimate is not None and (
+            isinstance(estimate, bool)
+            or not isinstance(estimate, int)
+            or estimate < 1
+        ):
+            raise ValueError("estimated_memory_mb must be a positive integer.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
