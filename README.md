@@ -16,6 +16,7 @@ A Python algorithmic-trading project combining market data, technical analysis, 
 | `execution/` | Order execution safeguards and persistent execution state |
 | `models/` | Market-data and position models |
 | `bot/` | Main bot orchestration |
+| `computing/` | Optional local task scheduler, resource manager, CPU process pool, and LLM adapter |
 | `test/` | Automated unit and safety tests |
 
 ### Processing flow
@@ -28,6 +29,55 @@ A Python algorithmic-trading project combining market data, technical analysis, 
 6. Keep execution in dry-run mode.
 
 Language-model output is advisory. Deterministic validation in the strategy and execution layers must remain authoritative.
+
+## Local Computing Core
+
+The computing core is an optional subsystem. The trading engine does not start it automatically and remains independent of it.
+
+- CPU-bound tasks use `ProcessPoolExecutor`; handlers must be module-level, pickleable callables.
+- `AI_ANALYSIS` tasks use an injected asynchronous Ollama client. The core does not create or close that client; its owner controls its lifecycle.
+- CPU task handlers are registered explicitly with `register_cpu_handler`.
+- Workers receive task payloads only. They do not receive a Trading 212 client or an order executor.
+- Running process-pool work cannot be forcibly stopped safely. Cancellation is immediate for queued tasks and best-effort for running tasks.
+
+Default resource limits can be overridden through environment variables:
+
+| Variable | Default |
+|---|---:|
+| `MAX_CPU_WORKERS` | `2` |
+| `MAX_LLM_PARALLEL` | `2` |
+| `MAX_TOTAL_TASKS` | `4` |
+| `MAX_MEMORY_USAGE_PERCENT` | `80` |
+| `MAX_CPU_USAGE_PERCENT` | `95` |
+| `OLLAMA_TIMEOUT` | `300` |
+| `OLLAMA_RETRIES` | `1` |
+
+The memory ceiling leaves at least 20% of physical memory outside the core's admission budget for macOS and other processes. Resource checks run before each dispatch.
+
+Example setup:
+
+```python
+from agents.ollama_client import OllamaClient
+from computing import ComputingOrchestrator, TaskType
+from config.settings import SETTINGS
+
+ollama = OllamaClient(
+    base_url=SETTINGS.ollama_base_url,
+    model=SETTINGS.ollama_model,
+    timeout=SETTINGS.ollama_timeout,
+    max_concurrent=2,
+)
+core = ComputingOrchestrator(llm_client=ollama)
+
+# Register a module-level, pickleable function for a CPU task:
+# core.register_cpu_handler(TaskType.BACKTEST, run_backtest)
+
+# task = await core.submit_task(TaskType.AI_ANALYSIS, {"prompt": "..."})
+# await core.shutdown()
+# await ollama.close()  # The caller closes the injected Ollama client.
+```
+
+Do not submit trading execution functions as CPU handlers. The computing core is analysis-only.
 
 ## Requirements
 
