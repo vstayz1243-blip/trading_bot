@@ -48,11 +48,11 @@ Default resource limits can be overridden through environment variables:
 | `MAX_LLM_PARALLEL` | `2` |
 | `MAX_TOTAL_TASKS` | `4` |
 | `MAX_MEMORY_USAGE_PERCENT` | `80` |
-| `MAX_CPU_USAGE_PERCENT` | `95` |
+| `MAX_CPU_USAGE_PERCENT` | `95` |\n| `DEFAULT_CPU_TASK_MEMORY_MB` | `256` |\n| `HEAVY_CPU_TASK_MEMORY_MB` | `2048` |\n| `LLM_TASK_MEMORY_MB` | `512` |
 | `OLLAMA_TIMEOUT` | `300` |
 | `OLLAMA_RETRIES` | `1` |
 
-The memory ceiling leaves at least 20% of physical memory outside the core's admission budget for macOS and other processes. Resource checks run before each dispatch.
+The memory ceiling leaves at least 20% of physical memory outside the core's admission budget for macOS and other processes. Backtests and strategy optimizations reserve 2 GiB each by default; smaller CPU analyses reserve 256 MiB and LLM requests 512 MiB. Active reservations are deducted before another task is admitted. Override an individual estimate with task metadata `estimated_memory_mb`. Resource checks run before each dispatch.
 
 Example setup:
 
